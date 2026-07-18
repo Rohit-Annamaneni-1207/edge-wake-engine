@@ -67,3 +67,79 @@ The raw STFT outputs linear frequencies, but human hearing is logarithmic. We us
 
 **4. Decibel Compression (Optimization Stability)**
 Raw acoustic power has a mathematically violent dynamic range. Feeding these raw power values into a neural network guarantees exploding gradients. We apply logarithmic compression ($10 \cdot \log_{10}(S / S_{ref})$) to convert the raw power into Decibels (dB). This preserves the acoustic relationships while compressing the values into a stable, narrow numerical range that is safe for gradient descent.
+
+### 6. Convolutional Grouping Mechanics
+
+The `groups` parameter in a Convolutional Neural Network dictates how input channels are mixed to produce output channels, representing a strict trade-off between computational cost and feature interaction.
+
+*   **Standard Convolution (`groups=1`):** Dense interaction. Every output channel is a combination of every input channel. Highly accurate but computationally massive.
+*   **Grouped Convolution (`groups=N`):** The input channels and filters are sliced into `N` parallel, independent lanes. A channel in Group A cannot interact with a channel in Group B. This creates block-diagonal weight matrices, drastically reducing parameters (e.g., used in ResNeXt to increase "cardinality").
+*   **Depthwise Convolution (`groups=in_channels`):** Maximum isolation. Every single input channel is placed in its own lane and processed by a single dedicated filter. It completely eliminates cross-channel interaction during the spatial filtering step, making it the mathematically cheapest convolution possible (e.g., used in MobileNet and edge-device architectures).
+
+### 7. Drawbacks of Depthwise Separable Convolutions
+
+While Depthwise Separable Convolutions (DSC) drastically reduce parameter counts and FLOPs for edge deployment, they introduce specific mathematical and hardware limitations:
+
+*   **Representational Capacity:** By separating spatial filtering from channel mixing, DSCs cannot learn joint spatial-channel relationships simultaneously. This limits their theoretical capacity, making them prone to underfitting on highly complex datasets compared to standard dense convolutions.
+*   **Memory Access Cost (MAC):** DSCs drastically reduce mathematical operations, but the volume of data moving in and out of memory remains high. This often shifts the hardware bottleneck from being Compute-Bound to Memory-Bandwidth Bound.
+*   **Suboptimal GPU Utilization:** Standard GPU architectures and CUDA libraries are highly optimized for the dense matrix multiplications of standard convolutions. Because DSCs are sparse and fragmented, they suffer from high memory overhead on desktop GPUs. Their latency advantages are usually only realized on specialized edge hardware (ARM, TPUs, mobile NPUs).
+
+### 8. Global Average Pooling (GAP) vs. Dense Layers
+
+**The Memory Bottleneck of Dense Layers**
+Traditional CNNs flatten their final multi-dimensional feature maps into a 1D vector before passing them through Fully Connected (Linear) layers. This design is highly inefficient, as the Dense layers often account for over 80% of a model's total parameter count, violating the strict memory budgets of edge hardware.
+
+**The GAP Solution**
+Global Average Pooling (`nn.AdaptiveAvgPool2d((1, 1))`) replaces this mechanism by computing the spatial mean of each individual feature map. A $(C, H, W)$ tensor is squashed into a $(C, 1, 1)$ tensor. 
+*   **Extreme Compression:** It drastically reduces the parameter requirement for the final classification head, preventing model bloat.
+*   **Temporal Invariance:** Dense layers are highly sensitive to the exact spatial/temporal coordinates of a feature. If a wake word is spoken slightly later in the audio buffer, the shift misaligns the features from the dense weights. GAP averages across the entire temporal axis, making the network invariant to temporal shifts. It detects the *presence* of an acoustic pattern regardless of its absolute position in the window.
+
+### 9. Why Not Just Flatten to a Single Neuron?
+
+If the goal is binary classification, flattening a 6,400-element feature map and connecting it to a single output neuron (`nn.Linear(6400, 1)`) seems like a simple solution, but it fails in edge-audio deployments for two reasons:
+
+*   **Destruction of Temporal Invariance (Weight-Locking):** Flattening physically maps a specific learned weight to a specific spatial/temporal coordinate in the input tensor. If the audio feature shifts in time (e.g., the user speaks slightly later in the 1-second buffer), the feature misaligns with the trained weight, causing a false negative. GAP averages across time before weights are applied, making the model shift-invariant.
+*   **Parameter Inefficiency:** A 6,400-to-1 linear layer requires 6,401 parameters. GAP compresses the spatial dimensions entirely, requiring only 65 parameters for the final classifier. This $100\times$ reduction is mandatory for strict microcontroller memory budgets.
+
+### 10. The PyTorch ETL Pipeline for Audio Sequence Data
+
+**Standardizing Temporal Dimensions (Padding/Truncation)**
+Convolutional Neural Networks (CNNs) operate on fixed-dimension matrices. However, audio data is inherently variable in length. To prevent tensor dimension mismatch errors during batched matrix multiplication, all incoming audio arrays must be strictly bounded. Signals shorter than the targeted window (e.g., 1 second) are padded with zeros (representing atmospheric silence), while longer signals are aggressively truncated. 
+
+**Injecting Channel Dimensions**
+PyTorch's `nn.Conv2d` expects 4D input tensors formatted as `(Batch, Channels, Height, Width)`. The output of an STFT/Mel filterbank is a 2D matrix of `(Frequency_Bins, Time_Frames)`. To conform to the API requirements without altering the underlying data, we must inject a dummy channel dimension of size 1 (representing mono audio) using `torch.unsqueeze(0)`, producing a shape of `(1, Freq, Time)` prior to batching.
+
+### 11. Real-Time Streaming: The Sliding Window & Ring Buffers
+
+**The Boundary Problem**
+In real-time inference, audio cannot be partitioned into rigid, non-overlapping 1-second blocks. If a spoken keyword happens to straddle the boundary between two blocks, the acoustic pattern is severed in half, guaranteeing a false negative from the neural network.
+
+**The Ring Buffer Solution**
+Production systems utilize a Continuous Sliding Window, implemented via a Ring Buffer. The hardware maintains a fixed memory allocation holding exactly 1 second of audio. As new acoustic data streams in, the oldest data is continuously evicted. 
+
+**Evaluation Stride**
+To balance compute limits with responsiveness, the system does not run inference continuously. It evaluates the 1-second buffer at a fixed stride (e.g., every 100ms or 250ms). Because these evaluation windows heavily overlap, a spoken keyword is guaranteed to eventually slide cleanly into the center of the buffer, entirely avoiding the boundary problem.
+
+### 12. Data Strategy for Wake Word Models
+
+**The Class Imbalance Reality**
+An always-on wake word model spends 99.9% of its lifecycle listening to silence, background noise, or irrelevant conversation. Therefore, the dataset must be heavily skewed to represent this reality. A robust training set often utilizes a 1:10 ratio of Positive (Wake Word) to Negative (Noise/Generic Speech) samples to aggressively penalize false positives.
+
+**Data Sourcing (16kHz, 1-Second Constraints)**
+*   **Positive Targets:** The Google Speech Commands v2 Dataset provides pre-formatted, 1-second/16kHz utterances of specific keywords, acting as the ideal baseline for edge-CNN training.
+*   **Hard Negatives (Speech):** Non-target words from Speech Commands and chopped segments from LibriSpeech teach the model to differentiate the specific wake word phonemes from generic human vowels.
+*   **Hard Negatives (Acoustic Noise):** Datasets like ESC-50 provide structural mechanical and environmental noise (HVAC, sirens, typing) to ensure the ZCR/Energy gates and the CNN do not misclassify broadband frequency spikes as speech.
+
+**DSP Augmentation**
+To artificially expand the representational capacity of the dataset and simulate real-world deployment, dynamic data augmentation is injected into the ETL pipeline. Clean speech signals are mathematically combined with scaled noise arrays, time-shifted across the 1-second buffer, and pitch-altered to force the CNN to learn the invariant core acoustic features of the keyword.
+
+### 13. Combating Class Imbalance via Focal Loss
+
+**The Flaw of Standard Cross-Entropy**
+In a streaming wake-word context, negative examples (silence/noise) vastly outnumber positive targets. Standard Binary Cross-Entropy (BCE) treats all errors equally. The massive volume of easily classified negative samples generates small individual gradients that, when aggregated, completely swamp the training signal, forcing the model to converge to a trivial majority-class predictor.
+
+**Focal Loss Dynamics**
+Focal Loss resolves this by introducing a modulating factor $(1 - p_t)^\gamma$ to the loss function. 
+*   When a sample is correctly classified with high confidence ($p_t \to 1$), the modulating factor approaches 0, suppressing its gradient contribution.
+*   When a sample is misclassified or ambiguous ($p_t \to 0$), the factor approaches 1, preserving the loss value.
+This focuses backpropagation strictly on the "hard" examples (e.g., words phonetically similar to the target or highly structured background sounds) while preventing the trivial background noise from dominating the model's weight updates.
