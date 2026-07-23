@@ -1,0 +1,13 @@
+# Core numerical and ML stack
+numpy
+scikit-learn
+torch
+torchaudio
+
+# DSP and audio utilities
+librosa
+soundfile
+
+# Visualization and demo UI
+matplotlib
+gradio
